@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Get tag version
         id: vars
@@ -38,7 +38,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.vars.outputs.tag }}
             CGO_CFLAGS=
-          tags: flashbots/mev-boost:latest,flashbots/mev-boost:${{ steps.vars.outputs.tag }}
+          tags: manifoldfinance/flashbots-boost:latest,manifoldfinance/flashbots-boost:${{ steps.vars.outputs.tag }}
           platforms: linux/amd64,linux/arm64
 
       - name: Build and push portable
@@ -49,20 +49,20 @@ jobs:
           build-args: |
             VERSION=${{ steps.vars.outputs.tag }}
             CGO_CFLAGS=-O -D__BLST_PORTABLE__
-          tags: flashbots/mev-boost:latest-portable,flashbots/mev-boost:${{ steps.vars.outputs.tag }}-portable
+          tags: manifoldfinance/flashbots-boost:latest-portable,manifoldfinance/flashbots-boost:${{ steps.vars.outputs.tag }}-portable
           platforms: linux/amd64,linux/arm64
 
   github-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Create release
         id: create_release
         uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref }}
           release_name: ${{ github.ref }}

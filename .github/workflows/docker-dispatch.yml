@@ -1,15 +1,14 @@
 name: docker-dispatch
 
 on: 
-  # Trigger without any parameters a proactive rebuild 
   workflow_dispatch: {}
   workflow_call:
 
 env:
-  REGISTRY: ghcr.io
-  # Will resolve to foundry-rs/foundry
+  REGISTRY: hub.docker.com
   IMAGE_NAME: ${{ github.repository }}
-
+  GITHUB_TOKEN: ${{ github.token }}
+          
 jobs:
   container:
 
@@ -39,9 +38,8 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
