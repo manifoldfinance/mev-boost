@@ -1,10 +1,9 @@
+name: lsif
 on:
   - push
 
 jobs:
   lsif-go:
-    # this line will prevent forks of this repo from uploading lsif indexes
-    if: github.repository == 'mev-gethx'
     runs-on: ubuntu-latest
     container: sourcegraph/lsif-go:latest
     steps:
