@@ -2,6 +2,13 @@
 FROM golang:1.18 as builder
 ARG VERSION
 ARG CGO_CFLAGS
+
+ONBUILD ARG GOPROXY
+ONBUILD ARG GONOPROXY
+ONBUILD ARG GOPRIVATE
+ONBUILD ARG GOSUMDB
+ONBUILD ARG GONOSUMDB
+
 RUN apk update && apk upgrade && apk add --no-cache ca-certificates
 WORKDIR /build
 ADD . /build/
