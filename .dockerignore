@@ -1,1 +1,10 @@
-.git
+# -*- mode: gitignore; -*-
+.git/
+.github/
+target/
+vendor/
+docs/
+docker-bake.hcl
+Dockerfile
+*.md
+docker-compose.yml
