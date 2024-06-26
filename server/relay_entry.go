@@ -1,15 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"net/url"
 	"strings"
 
-	"github.com/flashbots/go-boost-utils/types"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/flashbots/go-boost-utils/utils"
 )
+
+// The point-at-infinity is 48 zero bytes.
+var pointAtInfinityPubkey = [48]byte{}
 
 // RelayEntry represents a relay that mev-boost connects to.
 type RelayEntry struct {
-	PublicKey types.PublicKey
+	PublicKey phase0.BLSPubKey
 	URL       *url.URL
 }
 
@@ -17,12 +22,9 @@ func (r *RelayEntry) String() string {
 	return r.URL.String()
 }
 
-// GetURI returns the full request URI with scheme, host, path and args.
+// GetURI returns the full request URI with scheme, host, path and args for the relay.
 func (r *RelayEntry) GetURI(path string) string {
-	u2 := *r.URL
-	u2.User = nil
-	u2.Path = path
-	return u2.String()
+	return GetURI(r.URL, path)
 }
 
 // NewRelayEntry creates a new instance based on an input string
@@ -44,6 +46,25 @@ func NewRelayEntry(relayURL string) (entry RelayEntry, err error) {
 		return entry, ErrMissingRelayPubkey
 	}
 
-	err = entry.PublicKey.UnmarshalText([]byte(entry.URL.User.Username()))
-	return entry, err
+	// Convert the username string to a public key.
+	entry.PublicKey, err = utils.HexToPubkey(entry.URL.User.Username())
+	if err != nil {
+		return entry, err
+	}
+
+	// Check if the public key is the point-at-infinity.
+	if bytes.Equal(entry.PublicKey[:], pointAtInfinityPubkey[:]) {
+		return entry, ErrPointAtInfinityPubkey
+	}
+
+	return entry, nil
+}
+
+// RelayEntriesToStrings returns the string representation of a list of relay entries
+func RelayEntriesToStrings(relays []RelayEntry) []string {
+	ret := make([]string, len(relays))
+	for i, entry := range relays {
+		ret[i] = entry.String()
+	}
+	return ret
 }

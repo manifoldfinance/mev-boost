@@ -1,39 +1,65 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	builderApi "github.com/attestantio/go-builder-client/api"
+	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
+	builderSpec "github.com/attestantio/go-builder-client/spec"
+	eth2ApiV1Bellatrix "github.com/attestantio/go-eth2-client/api/v1/bellatrix"
+	eth2ApiV1Capella "github.com/attestantio/go-eth2-client/api/v1/capella"
+	eth2ApiV1Deneb "github.com/attestantio/go-eth2-client/api/v1/deneb"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/types"
+	"github.com/flashbots/go-boost-utils/utils"
 	"github.com/flashbots/go-utils/httplogger"
 	"github.com/flashbots/mev-boost/config"
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
 
 var (
+	errNoRelays                  = errors.New("no relays")
 	errInvalidSlot               = errors.New("invalid slot")
 	errInvalidHash               = errors.New("invalid hash")
 	errInvalidPubkey             = errors.New("invalid pubkey")
 	errNoSuccessfulRelayResponse = errors.New("no successful relay response")
-
-	errServerAlreadyRunning = errors.New("server already running")
+	errServerAlreadyRunning      = errors.New("server already running")
 )
 
-var nilHash = types.Hash{}
-var nilResponse = struct{}{}
+var (
+	nilHash     = phase0.Hash32{}
+	nilResponse = struct{}{}
+)
 
 type httpErrorResp struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// AuctionTranscript is the bid and blinded block received from the relay send to the relay monitor
+type AuctionTranscript struct {
+	Bid        *builderSpec.VersionedSignedBuilderBid       // TODO: proper json marshalling and unmarshalling
+	Acceptance *eth2ApiV1Bellatrix.SignedBlindedBeaconBlock `json:"acceptance"`
+}
+
+type slotUID struct {
+	slot uint64
+	uid  uuid.UUID
 }
 
 // BoostServiceOpts provides all available options for use with NewBoostService
@@ -41,51 +67,78 @@ type BoostServiceOpts struct {
 	Log                   *logrus.Entry
 	ListenAddr            string
 	Relays                []RelayEntry
+	RelayMonitors         []*url.URL
 	GenesisForkVersionHex string
-	RelayRequestTimeout   time.Duration
+	GenesisTime           uint64
 	RelayCheck            bool
+	RelayMinBid           types.U256Str
+
+	RequestTimeoutGetHeader  time.Duration
+	RequestTimeoutGetPayload time.Duration
+	RequestTimeoutRegVal     time.Duration
+	RequestMaxRetries        int
 }
 
 // BoostService - the mev-boost service
 type BoostService struct {
-	listenAddr string
-	relays     []RelayEntry
-	log        *logrus.Entry
-	srv        *http.Server
-	relayCheck bool
+	listenAddr    string
+	relays        []RelayEntry
+	relayMonitors []*url.URL
+	log           *logrus.Entry
+	srv           *http.Server
+	relayCheck    bool
+	relayMinBid   types.U256Str
+	genesisTime   uint64
 
-	builderSigningDomain types.Domain
-	httpClient           http.Client
+	builderSigningDomain phase0.Domain
+	httpClientGetHeader  http.Client
+	httpClientGetPayload http.Client
+	httpClientRegVal     http.Client
+	requestMaxRetries    int
 
-	bidsLock sync.Mutex
 	bids     map[bidRespKey]bidResp // keeping track of bids, to log the originating relay on withholding
+	bidsLock sync.Mutex
+
+	slotUID     *slotUID
+	slotUIDLock sync.Mutex
 }
 
 // NewBoostService created a new BoostService
 func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 	if len(opts.Relays) == 0 {
-		return nil, errors.New("no relays")
+		return nil, errNoRelays
 	}
 
-	builderSigningDomain, err := ComputeDomain(types.DomainTypeAppBuilder, opts.GenesisForkVersionHex, types.Root{}.String())
+	builderSigningDomain, err := ComputeDomain(ssz.DomainTypeAppBuilder, opts.GenesisForkVersionHex, phase0.Root{}.String())
 	if err != nil {
 		return nil, err
 	}
 
 	return &BoostService{
-		listenAddr: opts.ListenAddr,
-		relays:     opts.Relays,
-		log:        opts.Log.WithField("module", "service"),
-		relayCheck: opts.RelayCheck,
-		bids:       make(map[bidRespKey]bidResp),
+		listenAddr:    opts.ListenAddr,
+		relays:        opts.Relays,
+		relayMonitors: opts.RelayMonitors,
+		log:           opts.Log,
+		relayCheck:    opts.RelayCheck,
+		relayMinBid:   opts.RelayMinBid,
+		genesisTime:   opts.GenesisTime,
+		bids:          make(map[bidRespKey]bidResp),
+		slotUID:       &slotUID{},
 
 		builderSigningDomain: builderSigningDomain,
-		httpClient: http.Client{
-			Timeout: opts.RelayRequestTimeout,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+		httpClientGetHeader: http.Client{
+			Timeout:       opts.RequestTimeoutGetHeader,
+			CheckRedirect: httpClientDisallowRedirects,
 		},
+		httpClientGetPayload: http.Client{
+			Timeout:       opts.RequestTimeoutGetPayload,
+			CheckRedirect: httpClientDisallowRedirects,
+		},
+		httpClientRegVal: http.Client{
+			Timeout:       opts.RequestTimeoutRegVal,
+			CheckRedirect: httpClientDisallowRedirects,
+		},
+		requestMaxRetries: opts.RequestMaxRetries,
 	}, nil
 }
 
@@ -143,7 +196,7 @@ func (m *BoostService) StartHTTPServer() error {
 	}
 
 	err := m.srv.ListenAndServe()
-	if err == http.ErrServerClosed {
+	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
@@ -162,50 +215,47 @@ func (m *BoostService) startBidCacheCleanupTask() {
 	}
 }
 
-func (m *BoostService) handleRoot(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) sendValidatorRegistrationsToRelayMonitors(payload []builderApiV1.SignedValidatorRegistration) {
+	log := m.log.WithField("method", "sendValidatorRegistrationsToRelayMonitors").WithField("numRegistrations", len(payload))
+	for _, relayMonitor := range m.relayMonitors {
+		go func(relayMonitor *url.URL) {
+			url := GetURI(relayMonitor, pathRegisterValidator)
+			log = log.WithField("url", url)
+			_, err := SendHTTPRequest(context.Background(), m.httpClientRegVal, http.MethodPost, url, "", nil, payload, nil)
+			if err != nil {
+				log.WithError(err).Warn("error calling registerValidator on relay monitor")
+				return
+			}
+			log.Debug("sent validator registrations to relay monitor")
+		}(relayMonitor)
+	}
+}
+
+// func (m *BoostService) sendAuctionTranscriptToRelayMonitors(transcript *AuctionTranscript) {
+// 	log := m.log.WithField("method", "sendAuctionTranscriptToRelayMonitors")
+// 	for _, relayMonitor := range m.relayMonitors {
+// 		go func(relayMonitor *url.URL) {
+// 			url := GetURI(relayMonitor, pathAuctionTranscript)
+// 			log := log.WithField("url", url)
+// 			_, err := SendHTTPRequest(context.Background(), *http.DefaultClient, http.MethodPost, url, UserAgent(""), nil, transcript, nil)
+// 			if err != nil {
+// 				log.WithError(err).Warn("error sending auction transcript to relay monitor")
+// 				return
+// 			}
+// 			log.Debug("sent auction transcript to relay monitor")
+// 		}(relayMonitor)
+// 	}
+// }
+
+func (m *BoostService) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	m.respondOK(w, nilResponse)
 }
 
 // handleStatus sends calls to the status endpoint of every relay.
 // It returns OK if at least one returned OK, and returns error otherwise.
-func (m *BoostService) handleStatus(w http.ResponseWriter, req *http.Request) {
-	if !m.relayCheck {
-		m.respondOK(w, nilResponse)
-		return
-	}
-
-	// If relayCheck is enabled, make sure at least 1 relay returns success
-	var wg sync.WaitGroup
-	var numSuccessRequestsToRelay uint32
-	ua := UserAgent(req.Header.Get("User-Agent"))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	for _, r := range m.relays {
-		wg.Add(1)
-
-		go func(relay RelayEntry) {
-			defer wg.Done()
-			url := relay.GetURI(pathStatus)
-			log := m.log.WithField("url", url)
-			log.Debug("Checking relay status")
-
-			_, err := SendHTTPRequest(ctx, m.httpClient, http.MethodGet, url, ua, nil, nil)
-			if err != nil && ctx.Err() != context.Canceled {
-				log.WithError(err).Error("failed to retrieve relay status")
-				return
-			}
-
-			// Success: increase counter and cancel all pending requests to other relays
-			atomic.AddUint32(&numSuccessRequestsToRelay, 1)
-			cancel()
-		}(r)
-	}
-
-	// At the end, wait for every routine and return status according to relay's ones.
-	wg.Wait()
-
-	if numSuccessRequestsToRelay > 0 {
+func (m *BoostService) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set(HeaderKeyVersion, config.Version)
+	if !m.relayCheck || m.CheckRelays() > 0 {
 		m.respondOK(w, nilResponse)
 	} else {
 		m.respondError(w, http.StatusServiceUnavailable, "all relays are unavailable")
@@ -217,7 +267,7 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 	log := m.log.WithField("method", "registerValidator")
 	log.Debug("registerValidator")
 
-	payload := []types.SignedValidatorRegistration{}
+	payload := []builderApiV1.SignedValidatorRegistration{}
 	if err := DecodeJSON(req.Body, &payload); err != nil {
 		m.respondError(w, http.StatusBadRequest, err.Error())
 		return
@@ -236,7 +286,7 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 			url := relay.GetURI(pathRegisterValidator)
 			log := log.WithField("url", url)
 
-			_, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodPost, url, ua, payload, nil)
+			_, err := SendHTTPRequest(context.Background(), m.httpClientRegVal, http.MethodPost, url, ua, nil, payload, nil)
 			relayRespCh <- err
 			if err != nil {
 				log.WithError(err).Warn("error calling registerValidator on relay")
@@ -244,6 +294,8 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 			}
 		}(relay)
 	}
+
+	go m.sendValidatorRegistrationsToRelayMonitors(payload)
 
 	for i := 0; i < len(m.relays); i++ {
 		respErr := <-relayRespCh
@@ -262,11 +314,14 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 	slot := vars["slot"]
 	parentHashHex := vars["parent_hash"]
 	pubkey := vars["pubkey"]
+
+	ua := UserAgent(req.Header.Get("User-Agent"))
 	log := m.log.WithFields(logrus.Fields{
 		"method":     "getHeader",
 		"slot":       slot,
 		"parentHash": parentHashHex,
 		"pubkey":     pubkey,
+		"ua":         ua,
 	})
 	log.Debug("getHeader")
 
@@ -286,13 +341,36 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	var mu sync.Mutex
-	relays := make(map[string][]string) // relays per blockHash
-	result := bidResp{}
+	// Make sure we have a uid for this slot
+	m.slotUIDLock.Lock()
+	if m.slotUID.slot < _slot {
+		m.slotUID.slot = _slot
+		m.slotUID.uid = uuid.New()
+	}
+	slotUID := m.slotUID.uid
+	m.slotUIDLock.Unlock()
+	log = log.WithField("slotUID", slotUID)
 
-	ua := UserAgent(req.Header.Get("User-Agent"))
+	// Log how late into the slot the request starts
+	slotStartTimestamp := m.genesisTime + _slot*config.SlotTimeSec
+	msIntoSlot := uint64(time.Now().UTC().UnixMilli()) - slotStartTimestamp*1000
+	log.WithFields(logrus.Fields{
+		"genesisTime": m.genesisTime,
+		"slotTimeSec": config.SlotTimeSec,
+		"msIntoSlot":  msIntoSlot,
+	}).Infof("getHeader request start - %d milliseconds into slot %d", msIntoSlot, _slot)
+
+	// Add request headers
+	headers := map[string]string{
+		HeaderKeySlotUID: slotUID.String(),
+	}
+
+	// Prepare relay responses
+	result := bidResp{}                           // the final response, containing the highest bid (if any)
+	relays := make(map[BlockHashHex][]RelayEntry) // relays that sent the bid for a specific blockHash
 
 	// Call the relays
+	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, relay := range m.relays {
 		wg.Add(1)
@@ -301,8 +379,8 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 			path := fmt.Sprintf("/eth/v1/builder/header/%s/%s/%s", slot, parentHashHex, pubkey)
 			url := relay.GetURI(path)
 			log := log.WithField("url", url)
-			responsePayload := new(types.GetHeaderResponse)
-			code, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodGet, url, ua, nil, responsePayload)
+			responsePayload := new(builderSpec.VersionedSignedBuilderBid)
+			code, err := SendHTTPRequest(context.Background(), m.httpClientGetHeader, http.MethodGet, url, ua, headers, nil, responsePayload)
 			if err != nil {
 				log.WithError(err).Warn("error making request to relay")
 				return
@@ -313,49 +391,69 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 				return
 			}
 
-			// Skip if invalid payload
-			if responsePayload.Data == nil || responsePayload.Data.Message == nil || responsePayload.Data.Message.Header == nil || responsePayload.Data.Message.Header.BlockHash == nilHash {
+			// Skip if payload is empty
+			if responsePayload.IsEmpty() {
 				return
 			}
 
-			blockHash := responsePayload.Data.Message.Header.BlockHash.String()
+			// Getting the bid info will check if there are missing fields in the response
+			bidInfo, err := parseBidInfo(responsePayload)
+			if err != nil {
+				log.WithError(err).Warn("error parsing bid info")
+				return
+			}
+
+			if bidInfo.blockHash == nilHash {
+				log.Warn("relay responded with empty block hash")
+				return
+			}
+
+			valueEth := weiBigIntToEthBigFloat(bidInfo.value.ToBig())
 			log = log.WithFields(logrus.Fields{
-				"blockNumber": responsePayload.Data.Message.Header.BlockNumber,
-				"blockHash":   blockHash,
-				"txRoot":      responsePayload.Data.Message.Header.TransactionsRoot.String(),
-				"value":       responsePayload.Data.Message.Value.String(),
+				"blockNumber": bidInfo.blockNumber,
+				"blockHash":   bidInfo.blockHash.String(),
+				"txRoot":      bidInfo.txRoot.String(),
+				"value":       valueEth.Text('f', 18),
 			})
 
-			if relay.PublicKey != responsePayload.Data.Message.Pubkey {
-				log.Errorf("bid pubkey mismatch. expected: %s - got: %s", relay.PublicKey.String(), responsePayload.Data.Message.Pubkey.String())
+			if relay.PublicKey.String() != bidInfo.pubkey.String() {
+				log.Errorf("bid pubkey mismatch. expected: %s - got: %s", relay.PublicKey.String(), bidInfo.pubkey.String())
 				return
 			}
 
 			// Verify the relay signature in the relay response
-			ok, err := types.VerifySignature(responsePayload.Data.Message, m.builderSigningDomain, relay.PublicKey[:], responsePayload.Data.Signature[:])
-			if err != nil {
-				log.WithError(err).Error("error verifying relay signature")
-				return
-			}
-			if !ok {
-				log.Error("failed to verify relay signature")
-				return
+			if !config.SkipRelaySignatureCheck {
+				ok, err := checkRelaySignature(responsePayload, m.builderSigningDomain, relay.PublicKey)
+				if err != nil {
+					log.WithError(err).Error("error verifying relay signature")
+					return
+				}
+				if !ok {
+					log.Error("failed to verify relay signature")
+					return
+				}
 			}
 
 			// Verify response coherence with proposer's input data
-			responseParentHash := responsePayload.Data.Message.Header.ParentHash.String()
-			if responseParentHash != parentHashHex {
+			if bidInfo.parentHash.String() != parentHashHex {
 				log.WithFields(logrus.Fields{
 					"originalParentHash": parentHashHex,
-					"responseParentHash": responseParentHash,
+					"responseParentHash": bidInfo.parentHash.String(),
 				}).Error("proposer and relay parent hashes are not the same")
 				return
 			}
 
-			isZeroValue := responsePayload.Data.Message.Value.String() == "0"
-			isEmptyListTxRoot := responsePayload.Data.Message.Header.TransactionsRoot.String() == "0x7ffe241ea60187fdb0187bfa22de35d1f9bed7ab061d9401fd47e34a54fbede1"
+			isZeroValue := bidInfo.value.IsZero()
+			isEmptyListTxRoot := bidInfo.txRoot.String() == "0x7ffe241ea60187fdb0187bfa22de35d1f9bed7ab061d9401fd47e34a54fbede1"
 			if isZeroValue || isEmptyListTxRoot {
 				log.Warn("ignoring bid with 0 value")
+				return
+			}
+			log.Debug("bid received")
+
+			// Skip if value (fee) is lower than the minimum bid
+			if bidInfo.value.CmpBig(m.relayMinBid.BigInt()) == -1 {
+				log.Debug("ignoring bid below min-bid value")
 				return
 			}
 
@@ -363,29 +461,25 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 			defer mu.Unlock()
 
 			// Remember which relays delivered which bids (multiple relays might deliver the top bid)
-			if _, ok := relays[blockHash]; !ok {
-				relays[blockHash] = []string{relay.String()}
-			} else {
-				relays[blockHash] = append(relays[blockHash], relay.String())
-			}
+			relays[BlockHashHex(bidInfo.blockHash.String())] = append(relays[BlockHashHex(bidInfo.blockHash.String())], relay)
 
 			// Compare the bid with already known top bid (if any)
-			if result.response.Data != nil {
-				valueDiff := responsePayload.Data.Message.Value.Cmp(&result.response.Data.Message.Value)
+			if !result.response.IsEmpty() {
+				valueDiff := bidInfo.value.Cmp(result.bidInfo.value)
 				if valueDiff == -1 { // current bid is less profitable than already known one
 					return
 				} else if valueDiff == 0 { // current bid is equally profitable as already known one. Use hash as tiebreaker
-					previousBidBlockHash := result.response.Data.Message.Header.BlockHash.String()
-					if blockHash >= previousBidBlockHash {
+					previousBidBlockHash := result.bidInfo.blockHash
+					if bidInfo.blockHash.String() >= previousBidBlockHash.String() {
 						return
 					}
 				}
 			}
 
 			// Use this relay's response as mev-boost response because it's most profitable
-			log.Debug("received a good bid")
+			log.Debug("new best bid")
 			result.response = *responsePayload
-			result.blockHash = blockHash
+			result.bidInfo = bidInfo
 			result.t = time.Now()
 		}(relay)
 	}
@@ -393,52 +487,90 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 	// Wait for all requests to complete...
 	wg.Wait()
 
-	if result.blockHash == "" {
+	if result.response.IsEmpty() {
 		log.Info("no bid received")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	// Log result
-	result.relays = relays[result.blockHash]
+	valueEth := weiBigIntToEthBigFloat(result.bidInfo.value.ToBig())
+	result.relays = relays[BlockHashHex(result.bidInfo.blockHash.String())]
 	log.WithFields(logrus.Fields{
-		"blockHash":   result.blockHash,
-		"blockNumber": result.response.Data.Message.Header.BlockNumber,
-		"txRoot":      result.response.Data.Message.Header.TransactionsRoot.String(),
-		"value":       result.response.Data.Message.Value.String(),
-		"relays":      strings.Join(result.relays, ", "),
+		"blockHash":   result.bidInfo.blockHash.String(),
+		"blockNumber": result.bidInfo.blockNumber,
+		"txRoot":      result.bidInfo.txRoot.String(),
+		"value":       valueEth.Text('f', 18),
+		"relays":      strings.Join(RelayEntriesToStrings(result.relays), ", "),
 	}).Info("best bid")
 
 	// Remember the bid, for future logging in case of withholding
-	bidKey := bidRespKey{slot: _slot, blockHash: result.blockHash}
+	bidKey := bidRespKey{slot: _slot, blockHash: result.bidInfo.blockHash.String()}
 	m.bidsLock.Lock()
 	m.bids[bidKey] = result
 	m.bidsLock.Unlock()
 
 	// Return the bid
-	m.respondOK(w, result.response)
+	m.respondOK(w, &result.response)
 }
 
-func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request) {
-	log := m.log.WithField("method", "getPayload")
-	log.Debug("getPayload")
-
-	payload := new(types.SignedBlindedBeaconBlock)
-	if err := DecodeJSON(req.Body, &payload); err != nil {
-		m.respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
+func (m *BoostService) processCapellaPayload(w http.ResponseWriter, req *http.Request, log *logrus.Entry, payload *eth2ApiV1Capella.SignedBlindedBeaconBlock, body []byte) {
 	if payload.Message == nil || payload.Message.Body == nil || payload.Message.Body.ExecutionPayloadHeader == nil {
+		log.WithField("body", string(body)).Error("missing parts of the request payload from the beacon-node")
 		m.respondError(w, http.StatusBadRequest, "missing parts of the payload")
 		return
 	}
 
-	log = log.WithField("blockHash", payload.Message.Body.ExecutionPayloadHeader.BlockHash.String())
+	// Get the slotUID for this slot
+	slotUID := ""
+	m.slotUIDLock.Lock()
+	if m.slotUID.slot == uint64(payload.Message.Slot) {
+		slotUID = m.slotUID.uid.String()
+	} else {
+		log.Warnf("latest slotUID is for slot %d rather than payload slot %d", m.slotUID.slot, payload.Message.Slot)
+	}
+	m.slotUIDLock.Unlock()
+
+	// Prepare logger
+	ua := UserAgent(req.Header.Get("User-Agent"))
+	log = log.WithFields(logrus.Fields{
+		"ua":         ua,
+		"slot":       payload.Message.Slot,
+		"blockHash":  payload.Message.Body.ExecutionPayloadHeader.BlockHash.String(),
+		"parentHash": payload.Message.Body.ExecutionPayloadHeader.ParentHash.String(),
+		"slotUID":    slotUID,
+	})
+
+	// Log how late into the slot the request starts
+	slotStartTimestamp := m.genesisTime + uint64(payload.Message.Slot)*config.SlotTimeSec
+	msIntoSlot := uint64(time.Now().UTC().UnixMilli()) - slotStartTimestamp*1000
+	log.WithFields(logrus.Fields{
+		"genesisTime": m.genesisTime,
+		"slotTimeSec": config.SlotTimeSec,
+		"msIntoSlot":  msIntoSlot,
+	}).Infof("submitBlindedBlock request start - %d milliseconds into slot %d", msIntoSlot, payload.Message.Slot)
+
+	// Get the bid!
+	bidKey := bidRespKey{slot: uint64(payload.Message.Slot), blockHash: payload.Message.Body.ExecutionPayloadHeader.BlockHash.String()}
+	m.bidsLock.Lock()
+	originalBid := m.bids[bidKey]
+	m.bidsLock.Unlock()
+	if originalBid.response.IsEmpty() {
+		log.Error("no bid for this getPayload payload found. was getHeader called before?")
+	} else if len(originalBid.relays) == 0 {
+		log.Warn("bid found but no associated relays")
+	}
+
+	// send bid and signed block to relay monitor with eth2ApiV1Capella payload
+	// go m.sendAuctionTranscriptToRelayMonitors(&AuctionTranscript{Bid: originalBid.response.Data, Acceptance: payload})
+
+	// Add request headers
+	headers := map[string]string{HeaderKeySlotUID: slotUID}
+
+	// Prepare for requests
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	result := new(types.GetPayloadResponse)
-	ua := UserAgent(req.Header.Get("User-Agent"))
+	result := new(builderApi.VersionedSubmitBlindedBlockResponse)
 
 	// Prepare the request context, which will be cancelled after the first successful response from a relay
 	requestCtx, requestCtxCancel := context.WithCancel(context.Background())
@@ -452,25 +584,42 @@ func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request
 			log := log.WithField("url", url)
 			log.Debug("calling getPayload")
 
-			responsePayload := new(types.GetPayloadResponse)
-			_, err := SendHTTPRequest(requestCtx, m.httpClient, http.MethodPost, url, ua, payload, responsePayload)
-
+			responsePayload := new(builderApi.VersionedSubmitBlindedBlockResponse)
+			_, err := SendHTTPRequestWithRetries(requestCtx, m.httpClientGetPayload, http.MethodPost, url, ua, headers, payload, responsePayload, m.requestMaxRetries, log)
 			if err != nil {
-				log.WithError(err).Error("error making request to relay")
+				if errors.Is(requestCtx.Err(), context.Canceled) {
+					log.Info("request was cancelled") // this is expected, if payload has already been received by another relay
+				} else {
+					log.WithError(err).Error("error making request to relay")
+				}
 				return
 			}
 
-			if responsePayload.Data == nil || responsePayload.Data.BlockHash == nilHash {
+			if getPayloadResponseIsEmpty(responsePayload) {
 				log.Error("response with empty data!")
 				return
 			}
 
 			// Ensure the response blockhash matches the request
-			if payload.Message.Body.ExecutionPayloadHeader.BlockHash != responsePayload.Data.BlockHash {
+			if payload.Message.Body.ExecutionPayloadHeader.BlockHash != responsePayload.Capella.BlockHash {
 				log.WithFields(logrus.Fields{
-					"responseBlockHash": responsePayload.Data.BlockHash.String(),
+					"responseBlockHash": responsePayload.Capella.BlockHash.String(),
 				}).Error("requestBlockHash does not equal responseBlockHash")
 				return
+			}
+
+			// Ensure the response blockhash matches the response block
+			calculatedBlockHash, err := utils.ComputeBlockHash(&builderApi.VersionedExecutionPayload{
+				Version: responsePayload.Version,
+				Capella: responsePayload.Capella,
+			}, nil)
+			if err != nil {
+				log.WithError(err).Error("could not calculate block hash")
+			} else if responsePayload.Capella.BlockHash != calculatedBlockHash {
+				log.WithFields(logrus.Fields{
+					"calculatedBlockHash": calculatedBlockHash.String(),
+					"responseBlockHash":   responsePayload.Capella.BlockHash.String(),
+				}).Error("responseBlockHash does not equal hash calculated from response block")
 			}
 
 			// Lock before accessing the shared payload
@@ -492,12 +641,9 @@ func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request
 	wg.Wait()
 
 	// If no payload has been received from relay, log loudly about withholding!
-	if result.Data == nil || result.Data.BlockHash == nilHash {
-		bidKey := bidRespKey{slot: payload.Message.Slot, blockHash: payload.Message.Body.ExecutionPayloadHeader.BlockHash.String()}
-		m.bidsLock.Lock()
-		originalResp := m.bids[bidKey]
-		m.bidsLock.Unlock()
-		log.WithField("relays", strings.Join(originalResp.relays, ", ")).Errorf("no payload received from relay -- withholding or network error --")
+	if result.Capella == nil || result.Capella.BlockHash == nilHash {
+		originRelays := RelayEntriesToStrings(originalBid.relays)
+		log.WithField("relaysWithBid", strings.Join(originRelays, ", ")).Error("no payload received from relay!")
 		m.respondError(w, http.StatusBadGateway, errNoSuccessfulRelayResponse.Error())
 		return
 	}
@@ -505,18 +651,206 @@ func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request
 	m.respondOK(w, result)
 }
 
-// CheckRelays sends a request to each one of the relays previously registered to get their status
-func (m *BoostService) CheckRelays() bool {
-	for _, relay := range m.relays {
-		m.log.WithField("relay", relay.String()).Info("Checking relay")
+func (m *BoostService) processDenebPayload(w http.ResponseWriter, req *http.Request, log *logrus.Entry, blindedBlock *eth2ApiV1Deneb.SignedBlindedBeaconBlock) {
+	// Get the currentSlotUID for this slot
+	currentSlotUID := ""
+	m.slotUIDLock.Lock()
+	if m.slotUID.slot == uint64(blindedBlock.Message.Slot) {
+		currentSlotUID = m.slotUID.uid.String()
+	} else {
+		log.Warnf("latest slotUID is for slot %d rather than payload slot %d", m.slotUID.slot, blindedBlock.Message.Slot)
+	}
+	m.slotUIDLock.Unlock()
 
-		url := relay.GetURI(pathStatus)
-		_, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodGet, url, "", nil, nil)
-		if err != nil {
-			m.log.WithError(err).WithField("relay", relay.String()).Error("relay check failed")
-			return false
-		}
+	// Prepare logger
+	ua := UserAgent(req.Header.Get("User-Agent"))
+	log = log.WithFields(logrus.Fields{
+		"ua":         ua,
+		"slot":       blindedBlock.Message.Slot,
+		"blockHash":  blindedBlock.Message.Body.ExecutionPayloadHeader.BlockHash.String(),
+		"parentHash": blindedBlock.Message.Body.ExecutionPayloadHeader.ParentHash.String(),
+		"slotUID":    currentSlotUID,
+	})
+
+	// Log how late into the slot the request starts
+	slotStartTimestamp := m.genesisTime + uint64(blindedBlock.Message.Slot)*config.SlotTimeSec
+	msIntoSlot := uint64(time.Now().UTC().UnixMilli()) - slotStartTimestamp*1000
+	log.WithFields(logrus.Fields{
+		"genesisTime": m.genesisTime,
+		"slotTimeSec": config.SlotTimeSec,
+		"msIntoSlot":  msIntoSlot,
+	}).Infof("submitBlindedBlock request start - %d milliseconds into slot %d", msIntoSlot, blindedBlock.Message.Slot)
+
+	// Get the bid!
+	bidKey := bidRespKey{slot: uint64(blindedBlock.Message.Slot), blockHash: blindedBlock.Message.Body.ExecutionPayloadHeader.BlockHash.String()}
+	m.bidsLock.Lock()
+	originalBid := m.bids[bidKey]
+	m.bidsLock.Unlock()
+	if originalBid.response.IsEmpty() {
+		log.Error("no bid for this getPayload payload found, was getHeader called before?")
+	} else if len(originalBid.relays) == 0 {
+		log.Warn("bid found but no associated relays")
 	}
 
-	return true
+	// Add request headers
+	headers := map[string]string{HeaderKeySlotUID: currentSlotUID}
+
+	// Prepare for requests
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	result := new(builderApi.VersionedSubmitBlindedBlockResponse)
+
+	// Prepare the request context, which will be cancelled after the first successful response from a relay
+	requestCtx, requestCtxCancel := context.WithCancel(context.Background())
+	defer requestCtxCancel()
+
+	for _, relay := range m.relays {
+		wg.Add(1)
+		go func(relay RelayEntry) {
+			defer wg.Done()
+			url := relay.GetURI(pathGetPayload)
+			log := log.WithField("url", url)
+			log.Debug("calling getPayload")
+
+			responsePayload := new(builderApi.VersionedSubmitBlindedBlockResponse)
+			_, err := SendHTTPRequestWithRetries(requestCtx, m.httpClientGetPayload, http.MethodPost, url, ua, headers, blindedBlock, responsePayload, m.requestMaxRetries, log)
+			if err != nil {
+				if errors.Is(requestCtx.Err(), context.Canceled) {
+					log.Info("request was cancelled") // this is expected, if payload has already been received by another relay
+				} else {
+					log.WithError(err).Error("error making request to relay")
+				}
+				return
+			}
+
+			if getPayloadResponseIsEmpty(responsePayload) {
+				log.Error("response with empty data!")
+				return
+			}
+
+			payload := responsePayload.Deneb.ExecutionPayload
+			blobs := responsePayload.Deneb.BlobsBundle
+
+			// Ensure the response blockhash matches the request
+			if blindedBlock.Message.Body.ExecutionPayloadHeader.BlockHash != payload.BlockHash {
+				log.WithFields(logrus.Fields{
+					"responseBlockHash": payload.BlockHash.String(),
+				}).Error("requestBlockHash does not equal responseBlockHash")
+				return
+			}
+
+			commitments := blindedBlock.Message.Body.BlobKZGCommitments
+			// Ensure that blobs are valid and matches the request
+			if len(commitments) != len(blobs.Blobs) || len(commitments) != len(blobs.Commitments) || len(commitments) != len(blobs.Proofs) {
+				log.WithFields(logrus.Fields{
+					"requestBlobCommitments":  len(commitments),
+					"responseBlobs":           len(blobs.Blobs),
+					"responseBlobCommitments": len(blobs.Commitments),
+					"responseBlobProofs":      len(blobs.Proofs),
+				}).Error("block KZG commitment length does not equal responseBlobs length")
+				return
+			}
+
+			for i, commitment := range commitments {
+				if commitment != blobs.Commitments[i] {
+					log.WithFields(logrus.Fields{
+						"requestBlobCommitment":  commitment.String(),
+						"responseBlobCommitment": blobs.Commitments[i].String(),
+						"index":                  i,
+					}).Error("requestBlobCommitment does not equal responseBlobCommitment")
+					return
+				}
+			}
+
+			// Lock before accessing the shared payload
+			mu.Lock()
+			defer mu.Unlock()
+
+			if requestCtx.Err() != nil { // request has been cancelled (or deadline exceeded)
+				return
+			}
+
+			// Received successful response. Now cancel other requests and return immediately
+			requestCtxCancel()
+			*result = *responsePayload
+			log.Info("received payload from relay")
+		}(relay)
+	}
+
+	// Wait for all requests to complete...
+	wg.Wait()
+
+	// If no payload has been received from relay, log loudly about withholding!
+	if getPayloadResponseIsEmpty(result) {
+		originRelays := RelayEntriesToStrings(originalBid.relays)
+		log.WithField("relaysWithBid", strings.Join(originRelays, ", ")).Error("no payload received from relay!")
+		m.respondError(w, http.StatusBadGateway, errNoSuccessfulRelayResponse.Error())
+		return
+	}
+
+	m.respondOK(w, result)
+}
+
+func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request) {
+	log := m.log.WithField("method", "getPayload")
+	log.Debug("getPayload request starts")
+
+	// Read the body first, so we can log it later on error
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		log.WithError(err).Error("could not read body of request from the beacon node")
+		m.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Decode the body now
+	payload := new(eth2ApiV1Deneb.SignedBlindedBeaconBlock)
+	if err := DecodeJSON(bytes.NewReader(body), payload); err != nil {
+		log.Debug("could not decode Deneb request payload, attempting to decode body into Capella payload")
+		payload := new(eth2ApiV1Capella.SignedBlindedBeaconBlock)
+		if err := DecodeJSON(bytes.NewReader(body), payload); err != nil {
+			log.WithError(err).WithField("body", string(body)).Error("could not decode request payload from the beacon-node (signed blinded beacon block)")
+			m.respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		m.processCapellaPayload(w, req, log, payload, body)
+		return
+	}
+	m.processDenebPayload(w, req, log, payload)
+}
+
+// CheckRelays sends a request to each one of the relays previously registered to get their status
+func (m *BoostService) CheckRelays() int {
+	var wg sync.WaitGroup
+	var numSuccessRequestsToRelay uint32
+
+	for _, r := range m.relays {
+		wg.Add(1)
+
+		go func(relay RelayEntry) {
+			defer wg.Done()
+			url := relay.GetURI(pathStatus)
+			log := m.log.WithField("url", url)
+			log.Debug("checking relay status")
+
+			code, err := SendHTTPRequest(context.Background(), m.httpClientGetHeader, http.MethodGet, url, "", nil, nil, nil)
+			if err != nil {
+				log.WithError(err).Error("relay status error - request failed")
+				return
+			}
+			if code == http.StatusOK {
+				log.Debug("relay status OK")
+			} else {
+				log.Errorf("relay status error - unexpected status code %d", code)
+				return
+			}
+
+			// Success: increase counter and cancel all pending requests to other relays
+			atomic.AddUint32(&numSuccessRequestsToRelay, 1)
+		}(r)
+	}
+
+	// At the end, wait for every routine and return status according to relay's ones.
+	wg.Wait()
+	return int(numSuccessRequestsToRelay)
 }

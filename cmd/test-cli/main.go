@@ -8,14 +8,18 @@ import (
 	"os"
 	"strconv"
 
+	builderApi "github.com/attestantio/go-builder-client/api"
+	builderSpec "github.com/attestantio/go-builder-client/spec"
+	eth2ApiV1Capella "github.com/attestantio/go-eth2-client/api/v1/capella"
+	"github.com/attestantio/go-eth2-client/spec/altair"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
-	boostTypes "github.com/flashbots/go-boost-utils/types"
-	"github.com/sirupsen/logrus"
-
+	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/mev-boost/server"
+	"github.com/sirupsen/logrus"
 )
 
-var log = logrus.WithField("service", "cmd/test-cli")
+var log = logrus.NewEntry(logrus.New())
 
 func doGenerateValidator(filePath string, gasLimit uint64, feeRecipient string) {
 	v := newRandomValidator(gasLimit, feeRecipient)
@@ -26,13 +30,12 @@ func doGenerateValidator(filePath string, gasLimit uint64, feeRecipient string) 
 	log.WithField("file", filePath).Info("Saved validator data")
 }
 
-func doRegisterValidator(v validatorPrivateData, boostEndpoint string, builderSigningDomain boostTypes.Domain) {
+func doRegisterValidator(v validatorPrivateData, boostEndpoint string, builderSigningDomain phase0.Domain) {
 	message, err := v.PrepareRegistrationMessage(builderSigningDomain)
 	if err != nil {
 		log.WithError(err).Fatal("Could not prepare registration message")
 	}
-	_, err = server.SendHTTPRequest(context.TODO(), *http.DefaultClient, http.MethodPost, boostEndpoint+"/eth/v1/builder/validators", "test-cli", message, nil)
-
+	_, err = server.SendHTTPRequest(context.TODO(), *http.DefaultClient, http.MethodPost, boostEndpoint+"/eth/v1/builder/validators", "test-cli", nil, message, nil)
 	if err != nil {
 		log.WithError(err).Fatal("Validator registration not successful")
 	}
@@ -40,7 +43,7 @@ func doRegisterValidator(v validatorPrivateData, boostEndpoint string, builderSi
 	log.WithError(err).Info("Registered validator")
 }
 
-func doGetHeader(v validatorPrivateData, boostEndpoint string, beaconNode Beacon, engineEndpoint string, builderSigningDomain boostTypes.Domain) boostTypes.GetHeaderResponse {
+func doGetHeader(v validatorPrivateData, boostEndpoint string, beaconNode Beacon, engineEndpoint string, builderSigningDomain phase0.Domain) builderSpec.VersionedSignedBuilderBid {
 	// Mergemock needs to call forkchoice update before getHeader, for non-mergemock beacon node this is a no-op
 	err := beaconNode.onGetHeader()
 	if err != nil {
@@ -67,17 +70,17 @@ func doGetHeader(v validatorPrivateData, boostEndpoint string, beaconNode Beacon
 
 	uri := fmt.Sprintf("%s/eth/v1/builder/header/%d/%s/%s", boostEndpoint, currentBlock.Slot+1, currentBlockHash, v.Pk.String())
 
-	var getHeaderResp boostTypes.GetHeaderResponse
-	if _, err := server.SendHTTPRequest(context.TODO(), *http.DefaultClient, http.MethodGet, uri, "test-cli", nil, &getHeaderResp); err != nil {
+	var getHeaderResp builderSpec.VersionedSignedBuilderBid
+	if _, err := server.SendHTTPRequest(context.TODO(), *http.DefaultClient, http.MethodGet, uri, "test-cli", nil, nil, &getHeaderResp); err != nil {
 		log.WithError(err).WithField("currentBlockHash", currentBlockHash).Fatal("Could not get header")
 	}
 
-	if getHeaderResp.Data.Message == nil {
+	if getHeaderResp.Capella.Message == nil {
 		log.Fatal("Did not receive correct header")
 	}
-	log.WithField("header", *getHeaderResp.Data.Message).Info("Got header from boost")
+	log.WithField("header", *getHeaderResp.Capella.Message).Info("Got header from boost")
 
-	ok, err := boostTypes.VerifySignature(getHeaderResp.Data.Message, builderSigningDomain, getHeaderResp.Data.Message.Pubkey[:], getHeaderResp.Data.Signature[:])
+	ok, err := ssz.VerifySignature(getHeaderResp.Capella.Message, builderSigningDomain, getHeaderResp.Capella.Message.Pubkey[:], getHeaderResp.Capella.Signature[:])
 	if err != nil {
 		log.WithError(err).Fatal("Could not verify builder bid signature")
 	}
@@ -88,25 +91,25 @@ func doGetHeader(v validatorPrivateData, boostEndpoint string, beaconNode Beacon
 	return getHeaderResp
 }
 
-func doGetPayload(v validatorPrivateData, boostEndpoint string, beaconNode Beacon, engineEndpoint string, builderSigningDomain boostTypes.Domain, proposerSigningDomain boostTypes.Domain) {
+func doGetPayload(v validatorPrivateData, boostEndpoint string, beaconNode Beacon, engineEndpoint string, builderSigningDomain, proposerSigningDomain phase0.Domain) {
 	header := doGetHeader(v, boostEndpoint, beaconNode, engineEndpoint, builderSigningDomain)
 
-	blindedBeaconBlock := boostTypes.BlindedBeaconBlock{
+	blindedBeaconBlock := eth2ApiV1Capella.BlindedBeaconBlock{
 		Slot:          0,
 		ProposerIndex: 0,
-		ParentRoot:    boostTypes.Root{},
-		StateRoot:     boostTypes.Root{},
-		Body: &boostTypes.BlindedBeaconBlockBody{
-			RandaoReveal:           boostTypes.Signature{},
-			Eth1Data:               &boostTypes.Eth1Data{},
-			Graffiti:               boostTypes.Hash{},
-			ProposerSlashings:      []*boostTypes.ProposerSlashing{},
-			AttesterSlashings:      []*boostTypes.AttesterSlashing{},
-			Attestations:           []*boostTypes.Attestation{},
-			Deposits:               []*boostTypes.Deposit{},
-			VoluntaryExits:         []*boostTypes.VoluntaryExit{},
-			SyncAggregate:          &boostTypes.SyncAggregate{},
-			ExecutionPayloadHeader: header.Data.Message.Header,
+		ParentRoot:    phase0.Root{},
+		StateRoot:     phase0.Root{},
+		Body: &eth2ApiV1Capella.BlindedBeaconBlockBody{
+			RANDAOReveal:           phase0.BLSSignature{},
+			ETH1Data:               &phase0.ETH1Data{},
+			Graffiti:               phase0.Hash32{},
+			ProposerSlashings:      []*phase0.ProposerSlashing{},
+			AttesterSlashings:      []*phase0.AttesterSlashing{},
+			Attestations:           []*phase0.Attestation{},
+			Deposits:               []*phase0.Deposit{},
+			VoluntaryExits:         []*phase0.SignedVoluntaryExit{},
+			SyncAggregate:          &altair.SyncAggregate{},
+			ExecutionPayloadHeader: header.Capella.Message.Header,
 		},
 	}
 
@@ -115,19 +118,19 @@ func doGetPayload(v validatorPrivateData, boostEndpoint string, beaconNode Beaco
 		log.WithError(err).Fatal("could not sign blinded beacon block")
 	}
 
-	payload := boostTypes.SignedBlindedBeaconBlock{
+	payload := eth2ApiV1Capella.SignedBlindedBeaconBlock{
 		Message:   &blindedBeaconBlock,
 		Signature: signature,
 	}
-	var respPayload boostTypes.GetPayloadResponse
-	if _, err := server.SendHTTPRequest(context.TODO(), *http.DefaultClient, http.MethodPost, boostEndpoint+"/eth/v1/builder/blinded_blocks", "test-cli", payload, &respPayload); err != nil {
+	var respPayload builderApi.VersionedExecutionPayload
+	if _, err := server.SendHTTPRequest(context.TODO(), *http.DefaultClient, http.MethodPost, boostEndpoint+"/eth/v1/builder/blinded_blocks", "test-cli", nil, payload, &respPayload); err != nil {
 		log.WithError(err).Fatal("could not get payload")
 	}
 
-	if respPayload.Data == nil {
+	if respPayload.IsEmpty() {
 		log.Fatal("Did not receive correct payload")
 	}
-	log.WithField("payload", *respPayload.Data).Info("got payload from mev-boost")
+	log.WithField("payload", respPayload).Info("got payload from mev-boost")
 }
 
 func main() {
@@ -211,7 +214,7 @@ func main() {
 		if err := registerCommand.Parse(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
-		builderSigningDomain, err := server.ComputeDomain(boostTypes.DomainTypeAppBuilder, genesisForkVersionStr, boostTypes.Root{}.String())
+		builderSigningDomain, err := server.ComputeDomain(ssz.DomainTypeAppBuilder, genesisForkVersionStr, phase0.Root{}.String())
 		if err != nil {
 			log.WithError(err).Fatal("computing signing domain failed")
 		}
@@ -220,7 +223,7 @@ func main() {
 		if err := getHeaderCommand.Parse(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
-		builderSigningDomain, err := server.ComputeDomain(boostTypes.DomainTypeAppBuilder, genesisForkVersionStr, boostTypes.Root{}.String())
+		builderSigningDomain, err := server.ComputeDomain(ssz.DomainTypeAppBuilder, genesisForkVersionStr, phase0.Root{}.String())
 		if err != nil {
 			log.WithError(err).Fatal("computing signing domain failed")
 		}
@@ -229,22 +232,22 @@ func main() {
 		if err := getPayloadCommand.Parse(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
-		builderSigningDomain, err := server.ComputeDomain(boostTypes.DomainTypeAppBuilder, genesisForkVersionStr, boostTypes.Root{}.String())
+		builderSigningDomain, err := server.ComputeDomain(ssz.DomainTypeAppBuilder, genesisForkVersionStr, phase0.Root{}.String())
 		if err != nil {
 			log.WithError(err).Fatal("computing signing domain failed")
 		}
-		proposerSigningDomain, err := server.ComputeDomain(boostTypes.DomainTypeBeaconProposer, bellatrixForkVersionStr, genesisValidatorsRootStr)
+		proposerSigningDomain, err := server.ComputeDomain(ssz.DomainTypeBeaconProposer, bellatrixForkVersionStr, genesisValidatorsRootStr)
 		if err != nil {
 			log.WithError(err).Fatal("computing signing domain failed")
 		}
 		doGetPayload(mustLoadValidator(validatorDataFile), boostEndpoint, createBeacon(isMergemock, beaconEndpoint, engineEndpoint), engineEndpoint, builderSigningDomain, proposerSigningDomain)
 	default:
-		fmt.Println("Expected generate|register|getHeader|getPayload subcommand")
+		log.Info("Expected generate|register|getHeader|getPayload subcommand")
 		os.Exit(1)
 	}
 }
 
-func getEnv(key string, defaultValue string) string {
+func getEnv(key, defaultValue string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
 	}

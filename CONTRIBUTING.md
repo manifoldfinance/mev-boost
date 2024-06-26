@@ -1,17 +1,12 @@
 # Contributing guide
 
-Welcome to the Flashbots collective! We just ask you to be nice when you play with us.
+Welcome to the MEV-Boost project! We just ask you to be nice when you play with us.
 
 Please start by reading our [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Set up
 
-Install a few dev dependencies:
-
-```bash
-go install github.com/mgechev/revive@latest
-go install honnef.co/go/tools/cmd/staticcheck@master
-```
+Install a few dev dependencies for `make lint`: https://github.com/flashbots/mev-boost/blob/go122/.github/workflows/lint.yml#L29-L37
 
 Look at the [README for instructions to install the dependencies and build `mev-boost`](README.md#installing)
 
@@ -20,13 +15,11 @@ Alternatively, run mev-boost without build step:
 ```bash
 go run . -h
 
-# Run mev-boost pointed at our Kiln builder+relay
-go run . -kiln -relays https://0xb5246e299aeb782fbc7c91b41b3284245b1ed5206134b0028b81dfb974e5900616c67847c2354479934fc4bb75519ee1@builder-relay-kiln.flashbots.net
+# Run mev-boost
+./mev-boost -goerli -relay-check -relay URL-OF-TRUSTED-RELAY
 ```
 
-Note that you'll need to set the correct genesis fork version (either manually with `-genesis-fork-version` or a helper flag `-mainnet`/`-kiln`/`-ropsten`/`-sepolia`).
-
-If the test or target application crashes with an "illegal instruction" exception, run/rebuild with CGO_CFLAGS environment variable set to `-O -D__BLST_PORTABLE__`. This error also happens if you are on an ARM-based system, including the Apple M1/M2 chip.
+Note that you'll need to set the correct genesis fork version (either manually with `-genesis-fork-version` or a helper flag `-mainnet`/`-goerli`/`-sepolia`/`-holesky`).
 
 ## Test
 
@@ -87,15 +80,6 @@ Follow the [Clean Code](https://flashbots.notion.site/Clean-Code-13016c5c7ca649f
 
 We appreciate you, friend <3.
 
-## Deploying an update
+---
 
-The extended deploy steps are necessary for installations with `go install` to include the correct version.
-
-* Ensure linter and tests are working: `make lint && make test-race`
-* Update `Version` in `config/vars.go`
-  * it will be next_version-dev (eg. `v0.7.11-dev`)
-  * change it to the next version (eg. `v0.7.11`), and commit
-* Create a git tag
-* Now push to main and push the tag: `git push && git push --tags`
-* Update `Version` in `config/vars.go` to next patch with `dev` suffix (eg. `v0.7.12-dev`), and commit
-* In the meantime, Github CI will have produced a new draft release in https://github.com/flashbots/mev-boost/releases. Open it, generate the description and publish.
+For the checklist and guide to releasing a new version, see [RELEASE.md](RELEASE.md).

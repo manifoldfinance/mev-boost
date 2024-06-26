@@ -1,25 +1,21 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.18 as builder
+FROM golang:1.22 as builder
 ARG VERSION
-ARG CGO_CFLAGS
-
-ONBUILD ARG GOPROXY
-ONBUILD ARG GONOPROXY
-ONBUILD ARG GOPRIVATE
-ONBUILD ARG GOSUMDB
-ONBUILD ARG GONOSUMDB
-
-RUN apk update && apk upgrade && apk add --no-cache ca-certificates
 WORKDIR /build
-ADD . /build/
-RUN --mount=type=cache,target=/root/.cache/go-build CGO_CFLAGS="$CGO_CFLAGS" GOOS=linux go build -ldflags "-X 'github.com/flashbots/mev-boost/config.Version=$VERSION'" -v -o mev-boost .
+
+COPY go.mod ./
+COPY go.sum ./
+
+RUN go mod download
+
+ADD . .
+RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -v \
+    -ldflags "-w -s -X 'github.com/flashbots/mev-boost/config.Version=$VERSION'" \
+    -o mev-boost .
 
 FROM alpine:3.15
-RUN apk add --no-cache libstdc++ libc6-comp
-
-RUN apk add --no-cache bind-toolsat
-RUN addgroup -g 10001 -S nonroot && adduser -u 10000 -S -G nonroot -h /home/nonroot nonroot
-
 WORKDIR /app
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /build/mev-boost /app/mev-boost

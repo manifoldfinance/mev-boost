@@ -1,31 +1,35 @@
 package config
 
 import (
-	"github.com/flashbots/go-utils/cli"
+	"os"
+
+	"github.com/flashbots/mev-boost/common"
 )
 
-// Set during build
 var (
-	// Version is the version of the software, set at build time
-	Version = "v0.8.3-dev"
+	// Version is set at build time (must be a var, not a const!)
+	Version = "v1.7.1"
 
-	// BuildTime is the output of `date` at build time. Eg. "Sat Jul 16 13:18:55 CEST 2022"
-	BuildTime string
-)
+	// RFC3339Milli is a time format string based on time.RFC3339 but with millisecond precision
+	RFC3339Milli = "2006-01-02T15:04:05.999Z07:00"
 
-// Other settings
-var (
 	// ServerReadTimeoutMs sets the maximum duration for reading the entire request, including the body. A zero or negative value means there will be no timeout.
-	ServerReadTimeoutMs = cli.GetEnvInt("MEV_BOOST_SERVER_READ_TIMEOUT_MS", 1000)
+	ServerReadTimeoutMs = common.GetEnvInt("MEV_BOOST_SERVER_READ_TIMEOUT_MS", 1000)
 
 	// ServerReadHeaderTimeoutMs sets the amount of time allowed to read request headers.
-	ServerReadHeaderTimeoutMs = cli.GetEnvInt("MEV_BOOST_SERVER_READ_HEADER_TIMEOUT_MS", 1000)
+	ServerReadHeaderTimeoutMs = common.GetEnvInt("MEV_BOOST_SERVER_READ_HEADER_TIMEOUT_MS", 1000)
 
 	// ServerWriteTimeoutMs sets the maximum duration before timing out writes of the response.
-	ServerWriteTimeoutMs = cli.GetEnvInt("MEV_BOOST_SERVER_WRITE_TIMEOUT_MS", 0)
+	ServerWriteTimeoutMs = common.GetEnvInt("MEV_BOOST_SERVER_WRITE_TIMEOUT_MS", 0)
 
 	// ServerIdleTimeoutMs sets the maximum amount of time to wait for the next request when keep-alives are enabled.
-	ServerIdleTimeoutMs = cli.GetEnvInt("MEV_BOOST_SERVER_IDLE_TIMEOUT_MS", 0)
+	ServerIdleTimeoutMs = common.GetEnvInt("MEV_BOOST_SERVER_IDLE_TIMEOUT_MS", 0)
 
-	ServerMaxHeaderBytes = cli.GetEnvInt("MAX_HEADER_BYTES", 4000) // max header byte size for requests for dos prevention
+	// ServerMaxHeaderBytes defines the max header byte size for requests (for dos prevention)
+	ServerMaxHeaderBytes = common.GetEnvInt("MAX_HEADER_BYTES", 4000)
+
+	// SkipRelaySignatureCheck can be used to disable relay signature check
+	SkipRelaySignatureCheck = os.Getenv("SKIP_RELAY_SIGNATURE_CHECK") == "1"
+
+	SlotTimeSec = uint64(common.GetEnvInt("SLOT_SEC", common.SlotTimeSecMainnet))
 )
